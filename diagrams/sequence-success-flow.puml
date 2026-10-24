@@ -1,0 +1,104 @@
+@startuml sequence-success-flow
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam ParticipantPadding 12
+skinparam BoxPadding 8
+skinparam sequence {
+  LifeLineBorderColor #888888
+  ArrowColor #333333
+}
+
+title Fluxo de Sucesso — Saga Orquestrada "Create Order"
+
+actor "Cliente" as C
+participant "API Gateway" as GW
+box "Order Service" #E3F2FD
+  participant "Order API" as OA
+  participant "CreateOrderSaga\nOrchestrator" as ORC
+  database "Order DB\n(orders, saga_instance,\noutbox)" as ODB
+end box
+queue "Kafka" as K
+box "Inventory Service" #E8F5E9
+  participant "Inventory\nHandler" as INV
+  database "Inventory DB" as IDB
+end box
+box "Payment Service" #FFF3E0
+  participant "Payment\nHandler" as PAY
+  database "Payment DB" as PDB
+end box
+participant "Gateway\nFinanceiro (PSP)" as PSP
+
+autonumber "<b>[00]"
+
+== T1 — Criar pedido (transação local, compensável) ==
+C -> GW : POST /orders\nIdempotency-Key: {uuid-cliente}
+GW -> OA : encaminha requisição
+activate OA
+OA -> ORC : startSaga(orderData)
+activate ORC
+ORC -> ODB : <b>TX local:</b> INSERT order(status=PENDING)\n+ INSERT saga_instance(step=RESERVING_STOCK,\n   deadline_at=now+30s)\n+ INSERT outbox(ReserveStock)
+ORC --> OA : sagaId, orderId
+deactivate ORC
+OA --> GW : 202 Accepted {orderId, status: PENDING}
+deactivate OA
+GW --> C : 202 Accepted (cliente acompanha via\nGET /orders/{id} ou WebSocket)
+
+== T2 — Reservar estoque (compensável) ==
+ODB -> K : relay (CDC) publica\n<b>ReserveStock</b> → inventory.commands\n{messageId, sagaId, orderId, items}
+K -> INV : ReserveStock
+activate INV
+INV -> IDB : <b>TX local:</b> verifica processed_messages(messageId)\n+ UPDATE stock (available -= qty)\n+ INSERT reservation(orderId, status=RESERVED, expires_at)\n+ INSERT processed_messages + outbox(StockReserved)
+INV -->> K : <b>StockReserved</b> → order-saga.replies
+deactivate INV
+K -->> ORC : StockReserved {sagaId, reservationId}
+activate ORC
+ORC -> ODB : <b>TX local:</b> saga_instance.step=AUTHORIZING_PAYMENT\n(version+1, deadline_at=now+45s)\n+ outbox(AuthorizePayment)
+deactivate ORC
+
+== T3 — Autorizar pagamento (transação pivô) ==
+ODB -> K : relay publica <b>AuthorizePayment</b> → payment.commands\n{messageId, sagaId, orderId, amount, paymentToken}
+K -> PAY : AuthorizePayment
+activate PAY
+PAY -> PDB : verifica processed_messages + INSERT payment(status=PROCESSING)
+PAY -> PSP : POST /charges (síncrono, timeout 5s)\nIdempotency-Key: {sagaId}-PAYMENT\n[Retry exponencial + Circuit Breaker]
+activate PSP
+PSP --> PAY : 201 approved {transactionId}
+deactivate PSP
+PAY -> PDB : <b>TX local:</b> payment.status=AUTHORIZED\n+ processed_messages + outbox(PaymentAuthorized)
+PAY -->> K : <b>PaymentAuthorized</b> → order-saga.replies
+deactivate PAY
+K -->> ORC : PaymentAuthorized {sagaId, paymentId}
+activate ORC
+ORC -> ODB : <b>TX local:</b> saga_instance.step=CONFIRMING_STOCK\n+ outbox(ConfirmReservation)
+deactivate ORC
+note over ORC, PSP #FFF9C4
+  A partir daqui a saga <b>não pode mais ser revertida</b> pelo caminho de compensação:
+  os passos seguintes são <b>retriáveis</b> (repetidos até sucesso; nunca falham por regra de negócio).
+end note
+
+== T4 — Confirmar reserva (retriável) ==
+ODB -> K : relay publica <b>ConfirmReservation</b> → inventory.commands
+K -> INV : ConfirmReservation
+activate INV
+INV -> IDB : reservation.status=CONFIRMED (baixa definitiva)\n+ outbox(ReservationConfirmed)
+INV -->> K : <b>ReservationConfirmed</b>
+deactivate INV
+K -->> ORC : ReservationConfirmed
+
+== T5 — Aprovar pedido (retriável) ==
+activate ORC
+ORC -> ODB : <b>TX local:</b> order.status=APPROVED\n+ saga_instance.status=COMPLETED\n+ outbox(OrderApproved)
+deactivate ORC
+ODB -> K : relay publica <b>OrderApproved</b> → order.events
+K -->> C : notificação (e-mail / push / WebSocket)
+
+legend bottom
+  <b>-></b> síncrono (HTTP / escrita local)    <b>->></b> assíncrono (mensagem Kafka)
+  Toda mudança de estado + mensagem de saída ocorre na <b>mesma transação local</b> (Transactional Outbox).
+  Todo consumidor registra <b>messageId</b> em <i>processed_messages</i> (Idempotent Consumer).
+endlegend
+@enduml

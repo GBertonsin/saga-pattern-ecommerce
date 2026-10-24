@@ -1,0 +1,89 @@
+@startuml saga-architecture-overview
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam componentStyle rectangle
+skinparam ArrowColor #444444
+skinparam rectangle {
+  BorderColor #555555
+}
+skinparam database {
+  BackgroundColor #F5F5F5
+  BorderColor #555555
+}
+skinparam queue {
+  BackgroundColor #FFF4D6
+  BorderColor #B8860B
+}
+
+title Visão Geral — Saga Orquestrada "Create Order" (E-commerce)
+
+actor "Cliente\n(Web / App)" as client
+rectangle "API Gateway\n(auth, rate limit,\nIdempotency-Key)" as gw #EEF3FF
+
+rectangle "Order Service" as order #E3F2FD {
+  rectangle "Order API\n(REST)" as orderApi
+  rectangle "<b>CreateOrderSaga\n<b>Orchestrator</b>\n(máquina de estados)" as orch #BBDEFB
+  rectangle "Timeout Scheduler\n(varre deadline_at)" as sched
+  database "Order DB\n• orders\n• saga_instance\n• outbox\n• processed_messages" as orderDb
+}
+
+rectangle "Message Relay\n(Debezium CDC /\nOutbox Poller)" as relay #F3E5F5
+
+rectangle "Message Broker — Apache Kafka" as kafka #FFFBEA {
+  queue "inventory.commands" as qInvCmd
+  queue "payment.commands" as qPayCmd
+  queue "order-saga.replies" as qReplies
+  queue "order.events\n(OrderApproved / OrderCancelled)" as qEvents
+  queue "Dead-Letter Topics\n(ex.: payment.commands.DLT)" as qDlt #FFCDD2
+}
+
+rectangle "Inventory Service" as inv #E8F5E9 {
+  rectangle "Command Handler\n(Idempotent Consumer)" as invHandler
+  database "Inventory DB\n• stock\n• reservations (TTL)\n• outbox\n• processed_messages" as invDb
+}
+
+rectangle "Payment Service" as pay #FFF3E0 {
+  rectangle "Command Handler\n(Idempotent Consumer)" as payHandler
+  rectangle "Gateway Adapter\nRetry + Circuit Breaker\n+ Timeout" as payAdapter
+  database "Payment DB\n• payments\n• outbox\n• processed_messages" as payDb
+}
+
+rectangle "Gateway Financeiro\nExterno (PSP)" as psp #ECEFF1
+
+client --> gw : HTTPS (síncrono)
+gw --> orderApi : POST /orders\n202 Accepted
+orderApi --> orch : inicia saga
+orch --> orderDb : transação local\n(estado + outbox)
+sched ..> orderDb : consulta sagas\nexpiradas
+orderDb ..> relay : CDC (log de transações)
+relay --> qInvCmd : publica comandos
+relay --> qPayCmd
+relay --> qEvents
+
+qInvCmd --> invHandler : ReserveStock\nReleaseStock\nConfirmReservation
+invHandler --> invDb
+invHandler ..> qReplies : StockReserved / StockUnavailable\nStockReleased (via outbox)
+
+qPayCmd --> payHandler : AuthorizePayment\nRefundPayment
+payHandler --> payDb
+payHandler --> payAdapter
+payAdapter --> psp : HTTPS (síncrono)\nIdempotency-Key
+payHandler ..> qReplies : PaymentAuthorized /\nPaymentDeclined (via outbox)
+
+qReplies --> orch : respostas\n(correlationId = sagaId)
+
+invHandler ..> qDlt : falha após N retries
+payHandler ..> qDlt
+orch ..> qDlt
+
+legend right
+  <b>Legenda</b>
+  ——  chamada síncrona / escrita local
+  - - -  publicação assíncrona (mensageria)
+  Cada serviço possui <b>banco próprio</b> (Database per Service).
+  Comandos e eventos saem sempre via <b>Transactional Outbox</b>.
+endlegend
+@enduml
