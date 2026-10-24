@@ -91,43 +91,48 @@ As compensações são executadas em **ordem inversa** (C3 → C2 → C1) e são
 
 ## 5. Diagramas
 
-Todos os diagramas foram feitos em **PlantUML** (arquivo editável `.puml`) e exportados em **PNG** e **SVG** na pasta [`/diagrams`](diagrams).
+Todos os diagramas foram feitos em **PlantUML** (arquivo editável `.puml`) e exportados em **PNG** e **SVG** na pasta [`/diagrams`](diagrams). Os detalhes técnicos (outbox, idempotência, timeouts) ficam nas seções 6 e 7 e em [`docs/`](docs), para manter os diagramas legíveis.
 
-### 5.1 Visão geral da arquitetura — `saga-architecture-overview.png`
+### 5.1 Visão geral — `saga-architecture-overview.png`
 
 ![Visão geral da arquitetura](diagrams/saga-architecture-overview.png)
 
-**Descrição:** o cliente chama o **API Gateway** (síncrono, HTTPS) que encaminha ao **Order Service**. O Order Service responde imediatamente `202 Accepted` e o **orquestrador** grava, na mesma transação local, o pedido, o estado da Saga e a mensagem de comando na tabela **outbox**. O **Message Relay** (Debezium CDC) lê a outbox e publica no **Kafka**, nos tópicos `inventory.commands` e `payment.commands`. Os participantes processam os comandos como **Idempotent Consumers**, gravam no seu próprio banco e respondem no tópico `order-saga.replies`, correlacionado pelo `sagaId`. O **Payment Service** é o único que faz chamada síncrona externa (ao PSP), protegida por **Timeout + Retry + Circuit Breaker**. Mensagens que esgotam as tentativas vão para os **Dead-Letter Topics** (`*.DLT`). O **Timeout Scheduler** varre sagas com `deadline_at` vencido.
+O cliente chama o **API Gateway**, que encaminha ao **Order Service**, onde fica o **orquestrador da Saga**. O orquestrador grava o estado da Saga (`saga_instance`) e as mensagens de saída (`outbox`) no seu banco e se comunica com **Inventory** e **Payment** de forma assíncrona pelo **Kafka**. Cada serviço tem banco próprio. Só o Payment Service faz chamada síncrona externa (ao PSP), protegida por Retry e Circuit Breaker. Mensagens que falham repetidamente vão para **Dead-Letter Topics**.
 
 ### 5.2 Fluxo de sucesso — `sequence-success-flow.png`
 
 ![Fluxo de sucesso](diagrams/sequence-success-flow.png)
 
-**Descrição passo a passo:**
-
-1. **[01–07] T1 – Criar pedido (síncrono):** `POST /orders` com `Idempotency-Key`. Em uma única transação local, o Order Service cria o pedido `PENDING`, a linha em `saga_instance` (passo `RESERVING_STOCK`, com `deadline_at`) e o comando `ReserveStock` na outbox. Retorna **202 Accepted** — o cliente não fica bloqueado esperando a Saga.
-2. **[08–13] T2 – Reservar estoque (assíncrono):** o relay publica `ReserveStock`; o Inventory verifica `processed_messages`, decrementa o disponível, cria a reserva com expiração e responde `StockReserved`. O orquestrador avança para `AUTHORIZING_PAYMENT`.
-3. **[14–22] T3 – Autorizar pagamento (pivô):** o Payment Service chama o PSP de forma **síncrona** com `Idempotency-Key = {sagaId}-PAYMENT`, protegido por retry e circuit breaker, e responde `PaymentAuthorized`. **A partir daqui a Saga não volta atrás.**
-4. **[23–27] T4 – Confirmar reserva (retriável):** o estoque reservado vira baixa definitiva.
-5. **[28–30] T5 – Aprovar pedido (retriável):** `order.status = APPROVED`, `saga_instance.status = COMPLETED` e o evento `OrderApproved` é publicado para notificação/logística.
+1. **(1–3)** O cliente envia `POST /orders`; o pedido é criado como **PENDING** e o cliente recebe `202 Accepted` sem esperar o fim da Saga.
+2. **(4–6)** O orquestrador pede a reserva de estoque (`ReserveStock`) e recebe `StockReserved`.
+3. **(7–10)** O orquestrador pede o pagamento (`AuthorizePayment`); o Payment Service cobra no PSP e responde `PaymentAuthorized`. Este é o **passo pivô**: a partir daqui a Saga não volta atrás.
+4. **(11–12)** A reserva vira baixa definitiva (`ConfirmReservation`).
+5. **(13–14)** O pedido passa para **APPROVED** e o cliente é notificado.
 
 ### 5.3 Fluxo de falha e compensação — `sequence-compensation-flow.png`
 
 ![Fluxo de compensação](diagrams/sequence-compensation-flow.png)
 
-**Descrição:** cenário exigido pela atividade — o **Payment Service recusa o pagamento depois que o Inventory já reservou o produto**.
+Cenário exigido pela atividade: **o pagamento é recusado depois que o estoque já foi reservado**.
 
-1. **[01–07]** O PSP responde `402 declined`. O Payment Service grava `DECLINED` e responde `PaymentDeclined`.
-2. **[08–09]** O orquestrador muda a Saga para **`COMPENSATING`** e grava o comando `ReleaseStock` na outbox.
-3. **[10–16] C2 – Release Stock:** o Inventory devolve a quantidade ao estoque e marca a reserva como `RELEASED`. O bloco `alt` mostra que a compensação é idempotente: se a mensagem chegar duplicada, nada muda; se a reserva **ainda não existir** (o `ReserveStock` está atrasado na rede), é criado um registro *tombstone* `CANCELLED` que fará o `ReserveStock` atrasado ser ignorado.
-4. **[17–19] C1 – Cancel Order:** o pedido vai para `CANCELLED`, a Saga para `COMPENSATED` e o cliente é notificado.
-5. **[20–28] Variação – timeout do pagamento:** sem resposta até o `deadline_at`, o orquestrador **não assume falha** (o PSP pode ter cobrado). Ele reenvia o comando com o **mesmo `messageId`** e o Payment consulta o status real no PSP pela chave de idempotência. Se após `max_retries` o resultado continuar desconhecido, a Saga compensa também o pagamento (`RefundPayment`, idempotente). Se uma compensação falhar repetidamente, a mensagem vai para a **DLT** e a Saga fica `FAILED_NEEDS_ATTENTION`, gerando alerta para a operação.
+1. **(1–6)** Igual ao fluxo de sucesso: pedido PENDING e estoque reservado.
+2. **(7–10)** O PSP recusa a cobrança e o Payment Service responde `PaymentDeclined`.
+3. **(11–13) Compensação de T2 – ReleaseStock:** o estoque reservado é devolvido.
+4. **(14–15) Compensação de T1 – CancelOrder:** o pedido vai para **CANCELLED** e o cliente é avisado.
 
-### 5.4 (Extra) Máquina de estados do orquestrador — `saga-state-machine.png`
+As compensações acontecem em **ordem inversa** e são **idempotentes** (se a mensagem chegar duplicada, não há efeito extra — ver seção 6).
 
-![Máquina de estados](diagrams/saga-state-machine.png)
+### 5.4 (Extra) Timeout no pagamento — `sequence-timeout-flow.png`
 
-Mostra todos os estados persistidos na tabela `saga_instance`, as transições de sucesso, as transições de compensação (em rosa), os laços de retry por timeout e o estado terminal de exceção `FAILED_NEEDS_ATTENTION`.
+![Timeout no pagamento](diagrams/sequence-timeout-flow.png)
+
+Se o pagamento não responde dentro do prazo (`deadline_at`), o orquestrador **não assume que falhou**, porque o PSP pode ter cobrado o cliente. Ele reenvia o comando com o **mesmo `messageId`** e o Payment consulta o status no PSP com a **mesma chave de idempotência** (nunca cobra duas vezes). Se mesmo assim não houver resposta, a Saga estorna o pagamento (`RefundPayment`), libera o estoque e cancela o pedido.
+
+### 5.5 (Extra) Estados da Saga — `saga-state-machine.png`
+
+![Estados da Saga](diagrams/saga-state-machine.png)
+
+Estados percorridos pela Saga na tabela `saga_instance`. O caminho da esquerda é o sucesso; os estados em rosa são as compensações.
 
 ## 6. Matriz de decisão e idempotência
 
@@ -199,7 +204,10 @@ CREATE INDEX idx_saga_deadline ON saga_instance (deadline_at)
 │   ├── sequence-compensation-flow.png     ← sequência de falha e compensação
 │   ├── sequence-compensation-flow.puml
 │   ├── sequence-compensation-flow.svg
-│   ├── saga-state-machine.png             ← (extra) máquina de estados do orquestrador
+│   ├── sequence-timeout-flow.png          ← (extra) tratamento de timeout no pagamento
+│   ├── sequence-timeout-flow.puml
+│   ├── sequence-timeout-flow.svg
+│   ├── saga-state-machine.png             ← (extra) estados da Saga
 │   ├── saga-state-machine.puml
 │   └── saga-state-machine.svg
 └── docs/

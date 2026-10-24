@@ -1,52 +1,37 @@
 @startuml saga-state-machine
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontName "DejaVu Sans"
-skinparam defaultFontSize 12
+skinparam defaultFontSize 13
 skinparam shadowing false
 skinparam state {
-  BackgroundColor #F5F9FF
-  BorderColor #4A6FA5
-  ArrowColor #333333
+  BackgroundColor #E3F2FD
+  BorderColor #607D8B
+  ArrowColor #424242
 }
+hide empty description
 
-title Máquina de Estados do Orquestrador (tabela saga_instance)
+title Estados da Saga
 
-[*] --> STARTED : POST /orders\n(order PENDING)
-STARTED --> RESERVING_STOCK : envia ReserveStock
-RESERVING_STOCK --> AUTHORIZING_PAYMENT : StockReserved
-RESERVING_STOCK --> CANCELLING_ORDER : StockUnavailable
-RESERVING_STOCK --> RESERVING_STOCK : timeout → reenvia\n(mesmo messageId)
+[*] --> RESERVANDO_ESTOQUE
+RESERVANDO_ESTOQUE --> AUTORIZANDO_PAGAMENTO : estoque ok
+RESERVANDO_ESTOQUE --> CANCELANDO_PEDIDO : sem estoque
 
-AUTHORIZING_PAYMENT --> CONFIRMING_STOCK : PaymentAuthorized\n(ponto de não retorno)
-AUTHORIZING_PAYMENT --> RELEASING_STOCK : PaymentDeclined
-AUTHORIZING_PAYMENT --> AUTHORIZING_PAYMENT : timeout → reenvia /\nconsulta status no PSP
-AUTHORIZING_PAYMENT --> REFUNDING_PAYMENT : resultado desconhecido\napós max_retries
+AUTORIZANDO_PAGAMENTO --> APROVANDO_PEDIDO : pago
+AUTORIZANDO_PAGAMENTO --> LIBERANDO_ESTOQUE : recusado / timeout
 
-REFUNDING_PAYMENT --> RELEASING_STOCK : PaymentRefunded
-RELEASING_STOCK --> CANCELLING_ORDER : StockReleased
-CANCELLING_ORDER --> COMPENSATED : order CANCELLED
+LIBERANDO_ESTOQUE --> CANCELANDO_PEDIDO
+CANCELANDO_PEDIDO --> CANCELADO
+APROVANDO_PEDIDO --> APROVADO
 
-CONFIRMING_STOCK --> APPROVING_ORDER : ReservationConfirmed
-CONFIRMING_STOCK --> CONFIRMING_STOCK : falha técnica → retry
-APPROVING_ORDER --> COMPLETED : order APPROVED
+APROVADO --> [*]
+CANCELADO --> [*]
 
-COMPLETED --> [*]
-COMPENSATED --> [*]
-
-RELEASING_STOCK --> FAILED_NEEDS_ATTENTION : retries esgotados\n(mensagem em DLT)
-REFUNDING_PAYMENT --> FAILED_NEEDS_ATTENTION : retries esgotados
-CONFIRMING_STOCK --> FAILED_NEEDS_ATTENTION : retries esgotados
-FAILED_NEEDS_ATTENTION --> [*] : intervenção manual\n(reprocessar DLT)
-
-state COMPLETED #C8E6C9
-state COMPENSATED #FFE0B2
-state FAILED_NEEDS_ATTENTION #FFCDD2
-state REFUNDING_PAYMENT #FFEBEE : compensação de T3
-state RELEASING_STOCK #FFEBEE : compensação de T2
-state CANCELLING_ORDER #FFEBEE : compensação de T1
+state LIBERANDO_ESTOQUE #FFEBEE
+state CANCELANDO_PEDIDO #FFEBEE
+state APROVADO #C8E6C9
+state CANCELADO #FFCCBC
 
 legend bottom
-  Estados em <back:#FFEBEE>rosa</back> = transações compensatórias (ordem inversa)
-  Estados retriáveis (após o pivô) nunca voltam para compensação
+  Rosa = compensação
 endlegend
 @enduml

@@ -1,89 +1,61 @@
 @startuml saga-architecture-overview
+left to right direction
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontName "DejaVu Sans"
-skinparam defaultFontSize 12
+skinparam defaultFontSize 13
 skinparam shadowing false
-skinparam roundCorner 10
-skinparam componentStyle rectangle
-skinparam ArrowColor #444444
+skinparam roundCorner 12
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.3
+skinparam nodesep 40
+skinparam ranksep 70
 skinparam rectangle {
-  BorderColor #555555
+  BorderColor #607D8B
 }
 skinparam database {
-  BackgroundColor #F5F5F5
-  BorderColor #555555
+  BackgroundColor #FAFAFA
+  BorderColor #607D8B
 }
 skinparam queue {
-  BackgroundColor #FFF4D6
-  BorderColor #B8860B
+  BackgroundColor #FFF8E1
+  BorderColor #F9A825
 }
 
-title Visão Geral — Saga Orquestrada "Create Order" (E-commerce)
+title Visão Geral — Saga Orquestrada de Pedido
 
-actor "Cliente\n(Web / App)" as client
-rectangle "API Gateway\n(auth, rate limit,\nIdempotency-Key)" as gw #EEF3FF
+actor "Cliente" as client
+rectangle "API Gateway" as gw #ECEFF1
 
-rectangle "Order Service" as order #E3F2FD {
-  rectangle "Order API\n(REST)" as orderApi
-  rectangle "<b>CreateOrderSaga\n<b>Orchestrator</b>\n(máquina de estados)" as orch #BBDEFB
-  rectangle "Timeout Scheduler\n(varre deadline_at)" as sched
-  database "Order DB\n• orders\n• saga_instance\n• outbox\n• processed_messages" as orderDb
-}
+rectangle "**Order Service**\n\nOrquestrador da Saga" as order #BBDEFB
+database "Order DB" as odb
 
-rectangle "Message Relay\n(Debezium CDC /\nOutbox Poller)" as relay #F3E5F5
+queue "**Apache Kafka**\n\ncomandos · respostas · eventos" as kafka
 
-rectangle "Message Broker — Apache Kafka" as kafka #FFFBEA {
-  queue "inventory.commands" as qInvCmd
-  queue "payment.commands" as qPayCmd
-  queue "order-saga.replies" as qReplies
-  queue "order.events\n(OrderApproved / OrderCancelled)" as qEvents
-  queue "Dead-Letter Topics\n(ex.: payment.commands.DLT)" as qDlt #FFCDD2
-}
+rectangle "**Inventory Service**" as inv #C8E6C9
+database "Inventory DB" as idb
 
-rectangle "Inventory Service" as inv #E8F5E9 {
-  rectangle "Command Handler\n(Idempotent Consumer)" as invHandler
-  database "Inventory DB\n• stock\n• reservations (TTL)\n• outbox\n• processed_messages" as invDb
-}
+rectangle "**Payment Service**\n\nRetry + Circuit Breaker" as pay #FFE0B2
+database "Payment DB" as pdb
 
-rectangle "Payment Service" as pay #FFF3E0 {
-  rectangle "Command Handler\n(Idempotent Consumer)" as payHandler
-  rectangle "Gateway Adapter\nRetry + Circuit Breaker\n+ Timeout" as payAdapter
-  database "Payment DB\n• payments\n• outbox\n• processed_messages" as payDb
-}
+rectangle "Gateway de\nPagamento (PSP)" as psp #ECEFF1
 
-rectangle "Gateway Financeiro\nExterno (PSP)" as psp #ECEFF1
+client --> gw : HTTPS
+gw --> order : POST /orders
+order --> odb
+order <--> kafka : comandos /\nrespostas
+kafka <--> inv
+kafka <--> pay
+inv --> idb
+pay --> pdb
+pay --> psp : HTTPS
 
-client --> gw : HTTPS (síncrono)
-gw --> orderApi : POST /orders\n202 Accepted
-orderApi --> orch : inicia saga
-orch --> orderDb : transação local\n(estado + outbox)
-sched ..> orderDb : consulta sagas\nexpiradas
-orderDb ..> relay : CDC (log de transações)
-relay --> qInvCmd : publica comandos
-relay --> qPayCmd
-relay --> qEvents
+note bottom of kafka
+  Mensagens de erro após N tentativas
+  vão para **Dead-Letter Topics**
+end note
 
-qInvCmd --> invHandler : ReserveStock\nReleaseStock\nConfirmReservation
-invHandler --> invDb
-invHandler ..> qReplies : StockReserved / StockUnavailable\nStockReleased (via outbox)
-
-qPayCmd --> payHandler : AuthorizePayment\nRefundPayment
-payHandler --> payDb
-payHandler --> payAdapter
-payAdapter --> psp : HTTPS (síncrono)\nIdempotency-Key
-payHandler ..> qReplies : PaymentAuthorized /\nPaymentDeclined (via outbox)
-
-qReplies --> orch : respostas\n(correlationId = sagaId)
-
-invHandler ..> qDlt : falha após N retries
-payHandler ..> qDlt
-orch ..> qDlt
-
-legend right
-  <b>Legenda</b>
-  ——  chamada síncrona / escrita local
-  - - -  publicação assíncrona (mensageria)
-  Cada serviço possui <b>banco próprio</b> (Database per Service).
-  Comandos e eventos saem sempre via <b>Transactional Outbox</b>.
-endlegend
+note bottom of order
+  Estado da Saga na tabela
+  **saga_instance** + **outbox**
+end note
 @enduml

@@ -1,0 +1,40 @@
+@startuml sequence-timeout-flow
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 13
+skinparam shadowing false
+skinparam ParticipantPadding 25
+skinparam sequenceMessageAlign center
+skinparam sequence {
+  ArrowColor #424242
+  LifeLineBorderColor #9E9E9E
+  ParticipantBorderColor #607D8B
+}
+hide footbox
+
+title Timeout no Pagamento
+
+participant "Order Service\n(Orquestrador)" as O #BBDEFB
+participant "Inventory\nService" as I #C8E6C9
+participant "Payment\nService" as P #FFE0B2
+participant "Gateway\n(PSP)" as G #ECEFF1
+
+autonumber
+
+O ->> P : AuthorizePayment
+note over O : prazo (deadline_at)\nexpira sem resposta
+
+loop até 3 tentativas
+  O ->> P : reenvia AuthorizePayment\n(mesmo messageId)
+  P -> G : consulta status\n(mesma Idempotency-Key)
+end
+
+alt resposta recebida
+  P -->> O : PaymentAuthorized / PaymentDeclined
+  note over O : segue fluxo normal
+else continua sem resposta
+  O ->> P : RefundPayment
+  O ->> I : ReleaseStock
+  O -> O : pedido **CANCELLED**
+end
+@enduml

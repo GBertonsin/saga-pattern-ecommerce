@@ -1,106 +1,46 @@
 @startuml sequence-compensation-flow
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontName "DejaVu Sans"
-skinparam defaultFontSize 12
+skinparam defaultFontSize 13
 skinparam shadowing false
+skinparam ParticipantPadding 25
 skinparam sequenceMessageAlign center
-skinparam responseMessageBelowArrow true
-skinparam ParticipantPadding 12
-skinparam BoxPadding 8
 skinparam sequence {
-  LifeLineBorderColor #888888
-  ArrowColor #333333
+  ArrowColor #424242
+  LifeLineBorderColor #9E9E9E
+  ParticipantBorderColor #607D8B
 }
+hide footbox
 
-title Fluxo de Falha e Compensação — Pagamento recusado após reserva de estoque
+title Fluxo de Falha e Compensação (pagamento recusado)
 
-actor "Cliente" as C
-box "Order Service" #E3F2FD
-  participant "CreateOrderSaga\nOrchestrator" as ORC
-  database "Order DB\n(orders, saga_instance,\noutbox)" as ODB
-end box
-queue "Kafka" as K
-box "Inventory Service" #E8F5E9
-  participant "Inventory\nHandler" as INV
-  database "Inventory DB" as IDB
-end box
-box "Payment Service" #FFF3E0
-  participant "Payment\nHandler" as PAY
-  database "Payment DB" as PDB
-end box
-participant "Gateway\nFinanceiro (PSP)" as PSP
+actor Cliente as C
+participant "Order Service\n(Orquestrador)" as O #BBDEFB
+participant "Inventory\nService" as I #C8E6C9
+participant "Payment\nService" as P #FFE0B2
+participant "Gateway\n(PSP)" as G #ECEFF1
 
-autonumber "<b>[00]"
+autonumber
 
-== Passos T1 e T2 já concluídos com sucesso (ver fluxo feliz) ==
-note over ORC, IDB #E8F5E9
-  order.status = <b>PENDING</b> (semantic lock)
-  reservation.status = <b>RESERVED</b>
-  saga_instance.step = <b>AUTHORIZING_PAYMENT</b>
-end note
+C -> O : POST /orders
+O -> O : cria pedido **PENDING**
+O --> C : 202 Accepted
 
-== T3 — Autorizar pagamento: FALHA de negócio ==
-ODB -> K : relay publica <b>AuthorizePayment</b> → payment.commands
-K -> PAY : AuthorizePayment {messageId, sagaId, amount}
-activate PAY
-PAY -> PDB : processed_messages ok + payment(status=PROCESSING)
-PAY -> PSP : POST /charges\nIdempotency-Key: {sagaId}-PAYMENT
-activate PSP
-PSP --> PAY : <color:red><b>402 declined</b></color> (saldo insuficiente / antifraude)
-deactivate PSP
-PAY -> PDB : <b>TX local:</b> payment.status=DECLINED\n+ processed_messages + outbox(PaymentDeclined)
-PAY -->> K : <color:red><b>PaymentDeclined</b></color> {sagaId, reason}
-deactivate PAY
-K -->> ORC : PaymentDeclined
-activate ORC
-ORC -> ODB : <b>TX local:</b> saga_instance.status=<b>COMPENSATING</b>\nstep=RELEASING_STOCK + outbox(ReleaseStock)
-deactivate ORC
+O ->> I : ReserveStock
+I -> I : reserva estoque
+I -->> O : StockReserved
 
-== C2 — Compensar T2: liberar estoque (Release Stock) ==
-ODB -> K : relay publica <b>ReleaseStock</b> → inventory.commands\n{messageId, sagaId, orderId, reservationId}
-K -> INV : ReleaseStock
-activate INV
-alt reserva existe com status RESERVED
-  INV -> IDB : <b>TX local:</b> stock.available += qty\n+ reservation.status=RELEASED\n+ processed_messages + outbox(StockReleased)
-else reserva já RELEASED (mensagem duplicada)
-  INV -> IDB : nenhuma alteração (idempotente)\nreemite StockReleased
-else reserva inexistente (ReserveStock ainda não chegou)
-  INV -> IDB : INSERT reservation(orderId, status=<b>CANCELLED</b>)\n("tombstone": um ReserveStock atrasado será ignorado)
-end
-INV -->> K : <b>StockReleased</b> → order-saga.replies
-deactivate INV
-K -->> ORC : StockReleased {sagaId}
+O ->> P : AuthorizePayment
+P -> G : cobrança
+G --> P : <color:#C62828>**recusada**</color>
+P -->> O : <color:#C62828>**PaymentDeclined**</color>
 
-== C1 — Compensar T1: cancelar pedido (Cancel Order) ==
-activate ORC
-ORC -> ODB : <b>TX local:</b> order.status=<b>CANCELLED</b> (reason=PAYMENT_DECLINED)\n+ saga_instance.status=<b>COMPENSATED</b>\n+ outbox(OrderCancelled)
-deactivate ORC
-ODB -> K : relay publica <b>OrderCancelled</b> → order.events
-K -->> C : notificação: "Pagamento recusado. Pedido cancelado."
+== Compensação (ordem inversa) ==
 
-== Variação: TIMEOUT na resposta do pagamento (resultado desconhecido) ==
-note over ORC #FFF9C4
-  Timeout Scheduler detecta saga_instance com
-  step=AUTHORIZING_PAYMENT e <b>deadline_at < now()</b>.
-  <b>Timeout ≠ recusa</b>: o PSP pode ter cobrado o cliente.
-end note
-loop até max_retries (backoff exponencial 2s, 4s, 8s...)
-  ORC -->> K : reenvia AuthorizePayment (<b>mesmo messageId</b>)
-  K -->> PAY : AuthorizePayment (duplicado → idempotente)
-  PAY -> PSP : GET /charges?idempotencyKey={sagaId}-PAYMENT
-  PSP --> PAY : status real da cobrança
-  PAY -->> ORC : PaymentAuthorized ou PaymentDeclined
-end
-alt continua sem resposta após max_retries
-  ORC -->> K : <b>RefundPayment</b> (void/estorno preventivo, idempotente)
-  ORC -->> K : <b>ReleaseStock</b>
-  ORC -> ODB : order.status=CANCELLED\nsaga_instance.status=COMPENSATED
-else falha de compensação persistente
-  K -> K : mensagem vai para <b>*.DLT</b>\nsaga_instance.status=<b>FAILED_NEEDS_ATTENTION</b>\n(alerta para operação)
-end
+O ->> I : <color:#C62828>**ReleaseStock**</color>
+I -> I : devolve estoque
+I -->> O : StockReleased
 
-legend bottom
-  Compensações executadas em <b>ordem inversa</b>: C2 (ReleaseStock) → C1 (CancelOrder).
-  Toda compensação é <b>idempotente</b> e <b>retriável</b>: não pode falhar por regra de negócio.
-endlegend
+O -> O : <color:#C62828>**CancelOrder**</color>\npedido **CANCELLED**
+O -->> C : notificação "Pagamento recusado"
 @enduml
